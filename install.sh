@@ -63,7 +63,11 @@ CONTENT=$(base64 < "$TMP_FILE" | tr -d '\n')
 for repo in "$@"; do
   echo "→ Installing in $repo..."
 
-  SHA=$(gh api "repos/$repo/contents/$WORKFLOW_PATH" --jq .sha 2>/dev/null || true)
+  # Test the exit code, not the output: on a 404 gh still prints the error
+  # JSON to stdout, which would look like an existing file.
+  if ! SHA=$(gh api "repos/$repo/contents/$WORKFLOW_PATH" --jq .sha 2>/dev/null); then
+    SHA=""
+  fi
   if [ -n "$SHA" ]; then
     if [ "$UPDATE" != true ]; then
       echo "  ⚠️  $WORKFLOW_PATH already exists — skipping. Re-run with --update to overwrite."
