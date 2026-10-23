@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "description": "1-3 sentences in the detective voice: what the PR does, the headline concern (if any), and how serious it is overall."
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per inline comment posted, in the same order.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "info"]
+          },
+          "title": { "type": "string" },
+          "path": { "type": "string" },
+          "line": { "type": "integer" }
+        },
+        "required": ["severity", "title", "path"]
+      }
+    },
+    "lessons": {
+      "type": "array",
+      "description": "Proposed one-sentence lessons distilled from rejected prior findings. Empty when there are none.",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["verdict", "findings", "lessons"]
+}

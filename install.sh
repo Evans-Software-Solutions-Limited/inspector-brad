@@ -2,17 +2,26 @@
 # install.sh — push the Inspector Brad workflow file into many of your repos at once.
 #
 # Usage:
-#   ./install.sh OWNER/repo1 OWNER/repo2 OWNER/repo3
+#   ./install.sh [--update] OWNER/repo1 OWNER/repo2 OWNER/repo3
 #   ./install.sh $(gh repo list YOUR_USERNAME --limit 100 --json nameWithOwner -q '.[].nameWithOwner')
 #
 # Requires: gh CLI authenticated (`gh auth login`).
 
 set -euo pipefail
 
+UPDATE=false
+if [ "${1:-}" = "--update" ]; then
+  UPDATE=true
+  shift
+fi
+
 if [ $# -eq 0 ]; then
   cat <<USAGE
 Usage:
-  $0 OWNER/repo [OWNER/repo ...]
+  $0 [--update] OWNER/repo [OWNER/repo ...]
+
+  --update   Overwrite an existing workflow file if it differs from the
+             current template (otherwise existing installs are skipped).
 
 Examples:
   # Install on a single repo
@@ -24,6 +33,9 @@ Examples:
   # Install on repos in an org
   $0 \$(gh repo list YOUR_ORG --limit 100 --json nameWithOwner -q '.[].nameWithOwner')
 
+  # Roll out workflow changes to repos that already have Brad
+  $0 --update \$(gh repo list YOUR_ORG --limit 100 --json nameWithOwner -q '.[].nameWithOwner')
+
 Before running, edit the BOT_OWNER variable at the top of this script
 to point at YOUR inspector-brad repo (e.g. "brad").
 USAGE
@@ -32,110 +44,49 @@ fi
 
 # ---- EDIT THIS ----
 BOT_OWNER="BradleyEvans96"      # e.g. "brad"
-BOT_REPO="inspector-brad"           # the action repo name
-BOT_VERSION="v1"                  # tag to pin to
+BOT_REPO="inspector-brad"       # the action repo name
+BOT_VERSION="v1"                # tag to pin to
 # -------------------
 
 WORKFLOW_PATH=".github/workflows/claude-review.yml"
+TEMPLATE="$(cd "$(dirname "$0")" && pwd)/examples/consumer-workflow.yml"
 TMP_FILE=$(mktemp)
+trap 'rm -f "$TMP_FILE"' EXIT
 
-# Quoted heredoc so bash does NOT process backslashes or expand variables.
-# This keeps the output Prettier-clean (no collapsed line continuations) and
-# lets us drop in BOT_OWNER/BOT_REPO/BOT_VERSION via sed instead.
-cat > "$TMP_FILE" <<'WFEOF'
-name: Claude PR Review
-
-on:
-  issue_comment:
-    types: [created]
-  pull_request_review_comment:
-    types: [created]
-
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-  id-token: write
-  statuses: write
-  checks: write
-
-jobs:
-  review:
-    if: >-
-      (github.event.issue.pull_request != null || github.event.pull_request != null) &&
-      (
-        contains(github.event.comment.body, '@inspector-brad') ||
-        contains(github.event.comment.body, '/inspector-brad')
-      )
-    runs-on: ubuntu-latest
-    steps:
-      - name: Acknowledge with reaction
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh api -X POST \
-            "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-            -H "Accept: application/vnd.github+json" \
-            -f content="eyes"
-
-      - uses: actions/checkout@v4
-        with:
-          ref: refs/pull/${{ github.event.issue.number || github.event.pull_request.number }}/head
-          fetch-depth: 0
-
-      - id: review
-        uses: __BOT_OWNER__/__BOT_REPO__@__BOT_VERSION__
-        with:
-          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Optional overrides:
-          # model: claude-opus-4-7
-          # effort: high
-          # extra-instructions: |
-          #   This repo is a Django app. Be strict about N+1 queries.
-
-      - name: Report failure on PR
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh pr comment "${PR_NUMBER}" --repo "${REPO}" \
-            --body "🚨 **Inspector Brad failed to review this PR.** [View logs](${RUN_URL})"
-WFEOF
-
-# Now substitute the bot coordinates.
-sed -i.bak \
-  -e "s|__BOT_OWNER__|${BOT_OWNER}|g" \
-  -e "s|__BOT_REPO__|${BOT_REPO}|g" \
-  -e "s|__BOT_VERSION__|${BOT_VERSION}|g" \
-  "$TMP_FILE"
-rm -f "${TMP_FILE}.bak"
+# The example workflow is the single source of truth. Drop its leading
+# instructions comment block and point it at this bot's coordinates.
+awk 'body { print; next } /^#/ || /^$/ { next } { body = 1; print }' "$TEMPLATE" \
+  | sed -e "s|YOUR_GH_USERNAME/inspector-brad@v1|${BOT_OWNER}/${BOT_REPO}@${BOT_VERSION}|" \
+  > "$TMP_FILE"
+CONTENT=$(base64 < "$TMP_FILE" | tr -d '\n')
 
 for repo in "$@"; do
   echo "→ Installing in $repo..."
 
-  # Check if the file already exists
-  if gh api "repos/$repo/contents/$WORKFLOW_PATH" >/dev/null 2>&1; then
-    echo "  ⚠️  $WORKFLOW_PATH already exists — skipping. Delete manually if you want to overwrite."
-    continue
+  SHA=$(gh api "repos/$repo/contents/$WORKFLOW_PATH" --jq .sha 2>/dev/null || true)
+  if [ -n "$SHA" ]; then
+    if [ "$UPDATE" != true ]; then
+      echo "  ⚠️  $WORKFLOW_PATH already exists — skipping. Re-run with --update to overwrite."
+      continue
+    fi
+    if gh api "repos/$repo/contents/$WORKFLOW_PATH" -H "Accept: application/vnd.github.raw" \
+        | cmp -s - "$TMP_FILE"; then
+      echo "  ✓ Already up to date"
+      continue
+    fi
+    # Push via the contents API (single-file commit, no clone needed)
+    gh api -X PUT "repos/$repo/contents/$WORKFLOW_PATH" \
+      -f message="Update Inspector Brad workflow" \
+      -f content="$CONTENT" \
+      -f sha="$SHA" >/dev/null
+    echo "  ✅ Updated"
+  else
+    gh api -X PUT "repos/$repo/contents/$WORKFLOW_PATH" \
+      -f message="Install Inspector Brad" \
+      -f content="$CONTENT" >/dev/null
+    echo "  ✅ Installed"
   fi
-
-  # Push via the contents API (single-file commit, no clone needed)
-  SHA=""
-  CONTENT=$(base64 < "$TMP_FILE" | tr -d '\n')
-  gh api -X PUT "repos/$repo/contents/$WORKFLOW_PATH" \
-    -f message="Install Inspector Brad" \
-    -f content="$CONTENT" >/dev/null
-
-  echo "  ✅ Installed"
 done
-
-rm -f "$TMP_FILE"
 
 cat <<DONE
 
@@ -147,8 +98,9 @@ if you set it at the org level, every repo inherits it for free.
    the repo level instead:
      gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo OWNER/REPO
 
-Per-repo tuning: drop a .inspector-brad.md file at the repo root with
-guidance Brad should apply to every review of that repo. e.g.:
+Per-repo tuning: commit a .inspector-brad.md file at the repo root (on the
+branch your PRs target) with guidance Brad should apply to every review of that
+repo. e.g.:
 
   # .inspector-brad.md
   This is a Django app. Be strict about N+1 queries and missing
