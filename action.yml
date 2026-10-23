@@ -16,16 +16,18 @@ inputs:
     required: false
     default: ""
   github-token:
-    description: "GitHub token with pull-requests:write. Usually secrets.GITHUB_TOKEN."
+    description: "GitHub token with pull-requests:write (and statuses:write for the
+    commit status). Usually secrets.GITHUB_TOKEN."
     required: true
   model:
-    description: "Claude model. Defaults to claude-opus-4-7 for maximum bug-catching;
-    downshift to claude-sonnet-4-6 if quota burn matters more than depth."
+    description: "Claude model. Defaults to claude-opus-5-5 for maximum bug-catching;
+    switch to claude-sonnet-5-5 if quota burn matters more than depth."
     required: false
-    default: "claude-opus-4-7"
+    default: "claude-opus-5-5"
   effort:
-    description: "Review effort hint: low | medium | high. Default high — Brad reads
-    surrounding files, callers, and tests rather than skimming the diff."
+    description: "Claude Code effort level: low | medium | high | xhigh | max.
+    Controls how much the model thinks and explores. Default high; medium is a
+    good cheaper setting on Opus 5.5."
     required: false
     default: "high"
   extra-instructions:
@@ -36,54 +38,101 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Check auth
+      if: inputs.oauth-token == '' && inputs.anthropic-api-key == ''
+      shell: bash
+      run: |
+        echo "::error::Either oauth-token or anthropic-api-key must be set."
+        exit 1
+
     - name: Build review prompt
+      id: prep
       shell: bash
       env:
-        ACTION_PATH:         ${{ github.action_path }}
-        REPO:                ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        REPO: ${{ github.repository }}
         # PR number lives in different places depending on the trigger event.
-        PR_FROM_PR:          ${{ github.event.pull_request.number }}
-        PR_FROM_ISSUE:       ${{ github.event.issue.number }}
-        EFFORT:              ${{ inputs.effort }}
-        MODEL:               ${{ inputs.model }}
-        EXTRA_INSTRUCTIONS:  ${{ inputs.extra-instructions }}
-        # Read directly from the event so consumer workflows don't need to pass it.
-        # Empty for events without a comment (e.g. workflow_dispatch); the prompt
-        # tells Brad to skip the reaction swap when this is unset.
-        TRIGGER_COMMENT_ID:  ${{ github.event.comment.id }}
-        # `.inspector-brad.md` at the repo root, if present, is loaded as
-        # repo-specific guidance — mirrors Cursor's `.cursor/BUGBOT.md`.
-        REPO_CONFIG_PATH:    ${{ github.workspace }}/.inspector-brad.md
+        PR_FROM_PR: ${{ github.event.pull_request.number }}
+        PR_FROM_ISSUE: ${{ github.event.issue.number }}
+        EFFORT: ${{ inputs.effort }}
+        MODEL: ${{ inputs.model }}
+        EXTRA_INSTRUCTIONS: ${{ inputs.extra-instructions }}
+        # Anything the commenter wrote alongside the trigger phrase, e.g.
+        # "@inspector-brad focus on the auth changes".
+        TRIGGER_COMMENT_BODY: ${{ github.event.comment.body }}
       run: |
         PR_NUMBER="${PR_FROM_PR:-${PR_FROM_ISSUE}}"
         if [ -z "${PR_NUMBER}" ]; then
           echo "::error::Could not determine PR number from event payload."
           exit 1
         fi
+        case "${EFFORT}" in
+          low|medium|high|xhigh|max) ;;
+          *) echo "::error::effort must be one of low, medium, high, xhigh, max (got '${EFFORT}')."; exit 1 ;;
+        esac
         echo "Reviewing PR #${PR_NUMBER} in ${REPO}"
-        BASE_PROMPT=$(cat "${ACTION_PATH}/prompts/inspector_brad_system.md")
-        REPO_CONFIG=""
-        if [ -f "${REPO_CONFIG_PATH}" ]; then
-          REPO_CONFIG=$(cat "${REPO_CONFIG_PATH}")
-          echo "Loaded .inspector-brad.md ($(wc -c < "${REPO_CONFIG_PATH}") bytes)"
+
+        PR_META=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid,baseRefName)
+        HEAD_SHA=$(jq -r .headRefOid <<<"${PR_META}")
+        BASE_REF=$(jq -r .baseRefName <<<"${PR_META}")
+
+        # Show the review as in progress in the PR's check list. Best-effort:
+        # older consumer workflows may lack statuses:write.
+        gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+          -f state=pending -f context="Inspector Brad" -f description="Investigating…" >/dev/null \
+          || echo "::notice::Could not set pending commit status (missing statuses: write?)"
+
+        # `.inspector-brad.md` is read from the base branch, not the PR head, so
+        # a PR can't rewrite the rules it's reviewed under — the same reason
+        # CODEOWNERS is read from the base branch.
+        # (gh api prints the error body to stdout on a 404, hence the reset.)
+        REPO_CONFIG=$(gh api "repos/${REPO}/contents/.inspector-brad.md?ref=${BASE_REF}" \
+          -H "Accept: application/vnd.github.raw" 2>/dev/null) || REPO_CONFIG=""
+        if [ -n "${REPO_CONFIG}" ]; then
+          echo "Loaded .inspector-brad.md from ${BASE_REF}"
         else
-          echo ".inspector-brad.md not found at repo root — skipping repo-specific guidance"
+          echo ".inspector-brad.md not found on ${BASE_REF} — skipping repo-specific guidance"
         fi
+
+        # Prior Brad findings on this PR that a human reacted to or replied to,
+        # for the learning loop. Gathered here so the model doesn't need
+        # gh api access.
+        PRIOR_FEEDBACK=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null \
+          | jq -s -c '
+              (add // []) as $all
+              | [ $all[]
+                  | select(.user.type == "Bot" and .in_reply_to_id == null
+                           and (.body | test("(Critical|High|Medium|Low) Severity|🔵 Info")))
+                  | . as $f
+                  | { path, line, body: .body[0:600],
+                      thumbs_down: (.reactions["-1"] // 0),
+                      thumbs_up: (.reactions["+1"] // 0),
+                      replies: [ $all[]
+                                 | select(.in_reply_to_id == $f.id and .user.type != "Bot")
+                                 | { author: .user.login, body: .body[0:600] } ] }
+                  | select(.thumbs_down > 0 or .thumbs_up > 0 or (.replies | length) > 0) ]') \
+          || PRIOR_FEEDBACK="[]"
+
+        DIRECTION=$(sed -e 's#[@/]inspector-brad##g' <<<"${TRIGGER_COMMENT_BODY}" | sed -e '/^[[:space:]]*$/d')
+
         {
-          echo "FULL_PROMPT<<BUGBOT_PROMPT_EOF"
-          echo "${BASE_PROMPT}"
+          cat "${ACTION_PATH}/prompts/inspector_brad_system.md"
           echo ""
           echo "# Context for this review"
           echo "- Repo: ${REPO}"
           echo "- PR number: ${PR_NUMBER}"
-          echo "- Model: ${MODEL}"
-          echo "- Review effort: ${EFFORT}"
-          if [ -n "${TRIGGER_COMMENT_ID}" ]; then
-            echo "- Trigger comment ID: ${TRIGGER_COMMENT_ID}"
+          echo "- Head commit: ${HEAD_SHA}"
+          if [ -n "${DIRECTION}" ]; then
+            echo ""
+            echo "# Direction from the person who requested this review"
+            echo "Weigh this as a focus area; it doesn't narrow what counts as a bug."
+            echo ""
+            echo "${DIRECTION}"
           fi
           if [ -n "${REPO_CONFIG}" ]; then
             echo ""
-            echo "# Repo-specific guidance (from .inspector-brad.md at the repo root)"
+            echo "# Repo-specific guidance (from .inspector-brad.md on ${BASE_REF})"
             echo "${REPO_CONFIG}"
           fi
           if [ -n "${EXTRA_INSTRUCTIONS}" ]; then
@@ -91,34 +140,160 @@ runs:
             echo "# Repo-specific instructions (from workflow input)"
             echo "${EXTRA_INSTRUCTIONS}"
           fi
-          echo "BUGBOT_PROMPT_EOF"
-        } >> "${GITHUB_ENV}"
+          if [ "${PRIOR_FEEDBACK}" != "[]" ]; then
+            echo ""
+            echo "# Prior findings with human feedback"
+            echo '```json'
+            echo "${PRIOR_FEEDBACK}"
+            echo '```'
+          fi
+        } > "${RUNNER_TEMP}/inspector-brad-prompt.md"
 
-    - name: Claude review (OAuth / subscription)
-      if: inputs.oauth-token != ''
+        # Step outputs (not GITHUB_ENV) so the prompt doesn't leak into later
+        # job steps; random delimiter so no prompt content can terminate it.
+        DELIM="EOF_$(openssl rand -hex 16)"
+        {
+          echo "pr_number=${PR_NUMBER}"
+          echo "head_sha=${HEAD_SHA}"
+          echo "schema=$(jq -c . "${ACTION_PATH}/schemas/review-result.json")"
+          echo "prompt<<${DELIM}"
+          cat "${RUNNER_TEMP}/inspector-brad-prompt.md"
+          echo "${DELIM}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Investigate
+      id: review
       uses: anthropics/claude-code-action@v1
       with:
         claude_code_oauth_token: ${{ inputs.oauth-token }}
-        github_token:            ${{ inputs.github-token }}
-        prompt:                  ${{ env.FULL_PROMPT }}
+        # OAuth wins when both are set.
+        anthropic_api_key: ${{ inputs.oauth-token == '' && inputs.anthropic-api-key || '' }}
+        github_token: ${{ inputs.github-token }}
+        prompt: ${{ steps.prep.outputs.prompt }}
         claude_args: |
           --model ${{ inputs.model }}
-          --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(gh api:*),Read,Grep,Glob"
+          --effort ${{ inputs.effort }}
+          --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Read,Grep,Glob"
+          --json-schema '${{ steps.prep.outputs.schema }}'
 
-    - name: Claude review (API key fallback)
-      if: inputs.oauth-token == '' && inputs.anthropic-api-key != ''
-      uses: anthropics/claude-code-action@v1
-      with:
-        anthropic_api_key: ${{ inputs.anthropic-api-key }}
-        github_token:      ${{ inputs.github-token }}
-        prompt:            ${{ env.FULL_PROMPT }}
-        claude_args: |
-          --model ${{ inputs.model }}
-          --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(gh api:*),Read,Grep,Glob"
-
-    - name: Fail if no auth provided
-      if: inputs.oauth-token == '' && inputs.anthropic-api-key == ''
+    - name: Publish verdict
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.prep.outputs.pr_number }}
+        HEAD_SHA: ${{ steps.prep.outputs.head_sha }}
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        RESULT: ${{ steps.review.outputs.structured_output }}
+        EVENT_NAME: ${{ github.event_name }}
+        TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
       run: |
-        echo "::error::Either oauth-token or anthropic-api-key must be set."
-        exit 1
+        if [ -z "${RESULT}" ] || ! jq -e '.verdict' >/dev/null 2>&1 <<<"${RESULT}"; then
+          echo "::error::Claude did not return a structured review result."
+          exit 1
+        fi
+
+        count() { jq -r --arg s "$1" '[.findings[] | select(.severity == $s)] | length' <<<"${RESULT}"; }
+        CRIT=$(count critical); HIGH=$(count high); MED=$(count medium); LOW=$(count low); INFO=$(count info)
+        TOTAL=$((CRIT + HIGH + MED + LOW + INFO))
+        BLOCKING=$((CRIT + HIGH + MED))
+        VERDICT=$(jq -r .verdict <<<"${RESULT}")
+        FOOTER="<sub>Reviewed for commit \`${HEAD_SHA:0:7}\` · Model: \`${MODEL}\` · effort: \`${EFFORT}\`</sub>"
+
+        BODY_FILE="${RUNNER_TEMP}/inspector-brad-summary.md"
+        if [ "${TOTAL}" -eq 0 ]; then
+          {
+            echo "## 🕵️ Inspector Brad — case closed"
+            echo ""
+            echo "${VERDICT}"
+            echo ""
+            echo "> Re-open the case any time — comment \`@inspector-brad\` for another sweep."
+          } > "${BODY_FILE}"
+        else
+          LEADS="leads"; [ "${TOTAL}" -eq 1 ] && LEADS="lead"
+          LOG=""
+          [ "${CRIT}" -gt 0 ] && LOG+="🔴 ${CRIT} critical  "
+          [ "${HIGH}" -gt 0 ] && LOG+="🟠 ${HIGH} high  "
+          [ "${MED}" -gt 0 ] && LOG+="🟡 ${MED} medium  "
+          [ "${LOW}" -gt 0 ] && LOG+="🟢 ${LOW} low  "
+          [ "${INFO}" -gt 0 ] && LOG+="🔵 ${INFO} info  "
+          {
+            echo "## 🕵️ Inspector Brad — ${TOTAL} ${LEADS} on the case"
+            echo ""
+            echo "${VERDICT}"
+            echo ""
+            echo "**Evidence log:** ${LOG%  }"
+            echo ""
+            jq -r '
+              {critical: "🔴", high: "🟠", medium: "🟡", low: "🟢", info: "🔵"} as $emoji
+              | .findings[]
+              | "- \($emoji[.severity]) `\(.path)\(if .line then ":\(.line)" else "" end)` — \(.title)"' <<<"${RESULT}"
+            echo ""
+            echo "> Inline notes pinned to the scene above. Comment \`@inspector-brad\` after"
+            echo "> the fixes are in for another sweep."
+          } > "${BODY_FILE}"
+        fi
+        if jq -e '.lessons | length > 0' >/dev/null <<<"${RESULT}"; then
+          {
+            echo ""
+            echo "### Proposed lessons"
+            echo ""
+            echo "These findings were rejected by reviewers on an earlier run. If they're"
+            echo "repo-wide patterns rather than one-offs, move them into \`.inspector-brad.md\`"
+            echo "so future reviews skip them:"
+            echo ""
+            jq -r '.lessons[] | "- \(.)"' <<<"${RESULT}"
+          } >> "${BODY_FILE}"
+        fi
+        { echo ""; echo "${FOOTER}"; } >> "${BODY_FILE}"
+
+        # Replace, don't accumulate: drop earlier Brad summaries. Inline
+        # findings stay as the historical record.
+        gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '.[] | select(.user.type == "Bot" and (.body | startswith("## 🕵️ Inspector Brad"))) | .id' \
+          | while read -r ID; do
+              gh api -X DELETE "repos/${REPO}/issues/comments/${ID}" >/dev/null || true
+            done || echo "::notice::Could not clear prior summaries"
+        gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${BODY_FILE}"
+
+        # Swap the 👀 on the trigger comment for the verdict. Review-comment
+        # triggers live under pulls/comments, issue comments under issues/comments.
+        if [ -n "${TRIGGER_COMMENT_ID}" ]; then
+          if [ "${EVENT_NAME}" = "pull_request_review_comment" ]; then
+            COMMENT_API="repos/${REPO}/pulls/comments/${TRIGGER_COMMENT_ID}"
+          else
+            COMMENT_API="repos/${REPO}/issues/comments/${TRIGGER_COMMENT_ID}"
+          fi
+          gh api --paginate "${COMMENT_API}/reactions" \
+            --jq '.[] | select(.content == "eyes" and .user.type == "Bot") | .id' \
+            | while read -r RID; do
+                gh api -X DELETE "${COMMENT_API}/reactions/${RID}" >/dev/null || true
+              done || true
+          REACTION="+1"; [ "${TOTAL}" -gt 0 ] && REACTION="-1"
+          gh api -X POST "${COMMENT_API}/reactions" -f content="${REACTION}" >/dev/null \
+            || echo "::notice::Could not add verdict reaction"
+        fi
+
+        if [ "${BLOCKING}" -gt 0 ]; then
+          STATE=failure; DESC="${BLOCKING} issue(s) need attention"
+        elif [ "${TOTAL}" -gt 0 ]; then
+          STATE=success; DESC="${TOTAL} low-severity note(s)"
+        else
+          STATE=success; DESC="No issues found"
+        fi
+        gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+          -f state="${STATE}" -f context="Inspector Brad" -f description="${DESC}" >/dev/null \
+          || echo "::notice::Could not set commit status (missing statuses: write?)"
+
+    - name: Mark status as errored
+      if: failure() && steps.prep.outputs.head_sha != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ steps.prep.outputs.head_sha }}
+      run: |
+        gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+          -f state=error -f context="Inspector Brad" -f description="Review did not complete" >/dev/null \
+          || true
