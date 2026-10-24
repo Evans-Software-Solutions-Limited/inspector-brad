@@ -43,7 +43,7 @@ USAGE
 fi
 
 # ---- EDIT THIS ----
-BOT_OWNER="BradleyEvans96"      # e.g. "brad"
+BOT_OWNER="Evans-Software-Solutions-Limited" # e.g. "brad"
 BOT_REPO="inspector-brad"       # the action repo name
 BOT_VERSION="v1"                # tag to pin to
 # -------------------
